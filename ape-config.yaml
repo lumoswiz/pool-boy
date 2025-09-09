@@ -1,0 +1,5 @@
+plugins:
+  - name: etherscan
+    version: ">=0.8.4,<0.9"
+  - name: alchemy
+    version: ">=0.8.10,<0.9"
