@@ -1,3 +1,4 @@
+import json
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -78,6 +79,13 @@ class BotState:
     backlog: set[str] = field(default_factory=set)
     backfill_busy: bool = False
     lock: Lock = field(default_factory=Lock)
+
+
+def _cap_to_head(s: BotState, head: int) -> None:
+    if s.next_end is not None:
+        s.next_end = min(s.next_end, head)
+    if s.last_scan_block is not None:
+        s.last_scan_block = min(s.last_scan_block, head)
 
 
 # Backfill
@@ -222,17 +230,79 @@ def _resolve_state_path(bot_name: str | None = None) -> str:
     return os.path.join(_session_dir(bot_name), "bot-state.json")
 
 
+def _state_to_jsonable(s: BotState) -> dict:
+    return {
+        "next_end": s.next_end,
+        "chunk_no": s.chunk_no,
+        "last_scan_block": s.last_scan_block,
+        "seen_debtors": sorted(s.seen_debtors),
+        "backlog": sorted(s.backlog),
+    }
+
+
+def _state_from_jsonable(d: dict) -> BotState:
+    s = BotState()
+    if "next_end" in d:
+        s.next_end = d["next_end"]
+    s.chunk_no = int(d.get("chunk_no", s.chunk_no))
+    s.last_scan_block = int(d.get("last_scan_block", s.last_scan_block))
+    s.seen_debtors = set(d.get("seen_debtors", []))
+    s.backlog = set(d.get("backlog", []))
+    return s
+
+
+def _atomic_write_json(path: str, obj: dict) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        f.flush()
+    os.replace(tmp, path)
+
+
+def _restore_state(path: str | None = None) -> tuple[BotState | None, str]:
+    p = path or _resolve_state_path()
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return _state_from_jsonable(payload), p
+    except FileNotFoundError:
+        return None, p
+    except Exception as e:
+        click.echo(f"[state] restore failed ({p}): {e}")
+        return None, p
+
+
+def _save_state(s: BotState, path: str | None = None) -> str:
+    p = path or _resolve_state_path()
+    try:
+        _atomic_write_json(p, _state_to_jsonable(s))
+    except Exception as e:
+        click.echo(f"[state] snapshot failed ({p}): {e}")
+    return p
+
+
 # Silverback
 @bot.on_startup()
 def init_state(startup_state):
-    s = BotState(allowed_reserves=set(RESERVES.values()))
-    last = (
-        startup_state.get("last_block_processed")
-        if isinstance(startup_state, dict)
-        else getattr(startup_state, "last_block_processed", None)
-    )
-    s.next_end = last or chain.blocks.head.number
+    s, path = _restore_state()
+    restored = s is not None
+    if s is None:
+        s = BotState()
+    s.allowed_reserves = set(RESERVES.values())
+    head = chain.blocks.head.number
+    if s.next_end is None:
+        last = (
+            startup_state.get("last_block_processed")
+            if isinstance(startup_state, dict)
+            else getattr(startup_state, "last_block_processed", None)
+        )
+        s.next_end = last or head
+    _cap_to_head(s, head)
     bot.state.data = s
+    click.echo(
+        f"[state] {'restored' if restored else 'fresh'} init; path={path}, next_end={s.next_end}"
+    )
 
 
 @bot.on_(chain.blocks)
@@ -251,7 +321,10 @@ def on_borrow(log):
 @bot.on_shutdown()
 def handle_on_shutdown():
     s = bot.state.data
+    path = _save_state(s)
+    click.echo(f"[state] snapshot saved to: {path}")
     return {
         "backlog_size": len(s.backlog),
         "seen_debtors_total": len(s.seen_debtors),
+        "state_saved": True,
     }
