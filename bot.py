@@ -3,7 +3,7 @@ import os
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from threading import Lock
-from typing import Set
+from typing import Mapping, Set
 
 import click
 from ape import Contract, accounts, chain
@@ -118,11 +118,10 @@ def _maybe_debtor(log, allowed: Set[str]) -> str | None:
     return log.onBehalfOf if getattr(log, "reserve", None) in allowed else None
 
 
-def _iter_borrowers_range(start_block: int, stop_block: int, step: int, allowed: set[str]):
+def _iter_borrowers_with_height(start_block: int, stop_block: int, step: int, allowed: set[str]):
     for log in _iter_borrow_logs_range(start_block, stop_block, step):
-        d = _maybe_debtor(log, allowed)
-        if d:
-            yield d
+        if getattr(log, "reserve", None) in allowed:
+            yield (log.onBehalfOf, int(log.block_number))
 
 
 @contextmanager
@@ -135,12 +134,12 @@ def _try_lock(lock: Lock, timeout: float = 0.2):
             lock.release()
 
 
-def _enqueue_many_newer(addrs: Set[str], height: int, s: BotState) -> int:
+def _enqueue_many_newer(addr_heights: Mapping[str, int], s: BotState) -> int:
     added = 0
-    for a in addrs:
-        prev = s.seen_borrow_block.get(a, -1)
-        if prev < height:
-            s.seen_borrow_block[a] = height
+    for a, h in addr_heights.items():
+        prev = s.seen_borrow_block.get(a)
+        if prev is None or h > prev:
+            s.seen_borrow_block[a] = h
             if a not in s.backlog:
                 s.backlog.add(a)
                 added += 1
@@ -172,9 +171,13 @@ def _plan_window(s: BotState, head: int, mode: str) -> tuple[int, int] | None:
 
 
 def _scan_window(s: BotState, start: int, stop: int) -> tuple[int, int]:
-    addrs = set(_iter_borrowers_range(start, stop, s.rpc_max_log_range, s.allowed_reserves))
-    added = _enqueue_many_newer(addrs, stop, s)
-    return len(addrs), added
+    latest: dict[str, int] = {}
+    for a, h in _iter_borrowers_with_height(start, stop, s.rpc_max_log_range, s.allowed_reserves):
+        prev = latest.get(a)
+        if prev is None or h > prev:
+            latest[a] = h
+    added = _enqueue_many_newer(latest, s)
+    return len(latest), added
 
 
 def _commit_window(s: BotState, head: int, mode: str, start: int, stop: int) -> None:
@@ -236,11 +239,11 @@ def _process_live_borrow(s: BotState, log):
     debtor = _maybe_debtor(log, s.allowed_reserves)
     if not debtor:
         return {"borrow_event_ignored": 1}
-    height = int(getattr(log, "block_number", s.last_scan_block))
+    height = int(log.block_number)
     with _try_lock(s.lock, 0.2) as got:
         if not got:
             return {"borrow_event_skipped_locked": 1}
-        added = _enqueue_many_newer({debtor}, height, s)
+        added = _enqueue_many_newer({debtor: height}, s)
         return {
             "borrow_event": 1,
             "added_to_backlog": added,
