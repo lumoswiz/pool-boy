@@ -74,7 +74,6 @@ class BotState:
     rpc_max_log_range: int = _env_int("RPC_MAX_LOG_RANGE", 10)
     last_scan_block: int = 0
     next_end: int | None = None
-    chunk_no: int = 0
     seen_debtors: set[str] = field(default_factory=set)
     backlog: set[str] = field(default_factory=set)
     backfill_busy: bool = False
@@ -181,7 +180,6 @@ def _commit_window(s: BotState, head: int, mode: str, start: int, stop: int) -> 
         return
     if mode == BACKFILL:
         s.next_end = start - 1
-        s.chunk_no += 1
         s.last_backfill_head = head
         return
     raise ValueError(f"unknown mode: {mode}")
