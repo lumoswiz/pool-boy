@@ -74,7 +74,7 @@ class BotState:
     rpc_max_log_range: int = _env_int("RPC_MAX_LOG_RANGE", 10)
     last_scan_block: int = 0
     next_end: int | None = None
-    seen_debtors: set[str] = field(default_factory=set)
+    seen_borrow_block: dict[str, int] = field(default_factory=dict)
     backlog: set[str] = field(default_factory=set)
     backfill_busy: bool = False
     lock: Lock = field(default_factory=Lock)
@@ -135,13 +135,16 @@ def _try_lock(lock: Lock, timeout: float = 0.2):
             lock.release()
 
 
-def _enqueue_many(addrs: Set[str], s: BotState) -> int:
-    new = addrs - s.seen_debtors - s.backlog
-    if not new:
-        return 0
-    s.seen_debtors |= new
-    s.backlog |= new
-    return len(new)
+def _enqueue_many_newer(addrs: Set[str], height: int, s: BotState) -> int:
+    added = 0
+    for a in addrs:
+        prev = s.seen_borrow_block.get(a, -1)
+        if prev < height:
+            s.seen_borrow_block[a] = height
+            if a not in s.backlog:
+                s.backlog.add(a)
+                added += 1
+    return added
 
 
 FORWARD = "forward"
@@ -170,7 +173,7 @@ def _plan_window(s: BotState, head: int, mode: str) -> tuple[int, int] | None:
 
 def _scan_window(s: BotState, start: int, stop: int) -> tuple[int, int]:
     addrs = set(_iter_borrowers_range(start, stop, s.rpc_max_log_range, s.allowed_reserves))
-    added = _enqueue_many(addrs, s)
+    added = _enqueue_many_newer(addrs, stop, s)
     return len(addrs), added
 
 
@@ -221,7 +224,7 @@ def _sync_once(s: BotState, head: int, mode: str, max_windows: int = 1):
             f"{mode}_unique": uniq_total,
             f"{mode}_new": added_total,
             "backlog_size": len(s.backlog),
-            "seen_debtors_total": len(s.seen_debtors),
+            "seen_debtors_total": len(s.seen_borrow_block),
             "last_scan_block": s.last_scan_block,
             "next_end": s.next_end,
         }
@@ -233,15 +236,16 @@ def _process_live_borrow(s: BotState, log):
     debtor = _maybe_debtor(log, s.allowed_reserves)
     if not debtor:
         return {"borrow_event_ignored": 1}
+    height = int(getattr(log, "block_number", s.last_scan_block))
     with _try_lock(s.lock, 0.2) as got:
         if not got:
             return {"borrow_event_skipped_locked": 1}
-        added = _enqueue_many({debtor}, s)
+        added = _enqueue_many_newer({debtor}, height, s)
         return {
             "borrow_event": 1,
             "added_to_backlog": added,
             "backlog_size": len(s.backlog),
-            "seen_debtors_total": len(s.seen_debtors),
+            "seen_debtors_total": len(s.seen_borrow_block),
         }
 
 
@@ -267,7 +271,7 @@ def _state_to_jsonable(s: BotState) -> dict:
     return {
         "next_end": s.next_end,
         "last_scan_block": s.last_scan_block,
-        "seen_debtors": sorted(s.seen_debtors),
+        "seen_borrow_block": s.seen_borrow_block,
         "backlog": sorted(s.backlog),
     }
 
@@ -277,7 +281,7 @@ def _state_from_jsonable(d: dict) -> BotState:
     if "next_end" in d:
         s.next_end = d["next_end"]
     s.last_scan_block = int(d.get("last_scan_block", s.last_scan_block))
-    s.seen_debtors = set(d.get("seen_debtors", []))
+    s.seen_borrow_block = {k: int(v) for k, v in d.get("seen_borrow_block", {}).items()}
     s.backlog = set(d.get("backlog", []))
     return s
 
@@ -363,6 +367,6 @@ def handle_on_shutdown():
     click.echo(f"[state] snapshot saved to: {path}")
     return {
         "backlog_size": len(s.backlog),
-        "seen_debtors_total": len(s.seen_debtors),
+        "seen_debtors_total": len(s.seen_borrow_block),
         "state_saved": True,
     }
