@@ -156,7 +156,6 @@ def _plan_window(s: BotState, head: int, mode: str) -> tuple[int, int] | None:
             return None
         stop = min(start + s.chunk_blocks - 1, head)
         return start, stop
-
     if mode == BACKFILL:
         if s.next_end is None or s.next_end > head:
             s.next_end = head
@@ -167,7 +166,6 @@ def _plan_window(s: BotState, head: int, mode: str) -> tuple[int, int] | None:
         if stop < start:
             return None
         return start, stop
-
     raise ValueError(f"unknown mode: {mode}")
 
 
@@ -194,14 +192,12 @@ def _sync_once(s: BotState, head: int, mode: str, max_windows: int = 1):
         return {f"{mode}_skipped_no_state": 1}
     if not s.lock.acquire(timeout=0.2):
         return {f"{mode}_skipped_locked": 1}
-
     try:
         windows = 0
         uniq_total = 0
         added_total = 0
         first_start = None
         last_stop = None
-
         while windows < max_windows:
             plan = _plan_window(s, head, mode)
             if plan is None:
@@ -218,7 +214,6 @@ def _sync_once(s: BotState, head: int, mode: str, max_windows: int = 1):
             windows += 1
             uniq_total += uniq
             added_total += added
-
         span = (last_stop - first_start + 1) if (first_start is not None) else 0
         return {
             f"{mode}_windows": windows,
@@ -329,23 +324,16 @@ def init_state(startup_state):
         s = BotState()
     s.allowed_reserves = set(RESERVES.values())
     head = chain.blocks.head.number
-
+    if s.next_end is None:
+        last = (
+            startup_state.get("last_block_processed")
+            if isinstance(startup_state, dict)
+            else getattr(startup_state, "last_block_processed", None)
+        )
+        s.next_end = last or head
     if not restored:
         s.last_scan_block = head
-        s.next_end = head
-    else:
-        if s.next_end is None:
-            last = (
-                startup_state.get("last_block_processed")
-                if isinstance(startup_state, dict)
-                else getattr(startup_state, "last_block_processed", None)
-            )
-            s.next_end = last or head
-        if s.next_end is not None:
-            s.next_end = min(s.next_end, head)
-        if s.last_scan_block is not None:
-            s.last_scan_block = min(s.last_scan_block, head)
-
+    _cap_to_head(s, head)
     bot.state.data = s
     click.echo(
         f"[state] {'restored' if restored else 'fresh'} init; path={path}, next_end={s.next_end}"
