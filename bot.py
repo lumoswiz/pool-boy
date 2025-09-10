@@ -167,6 +167,17 @@ def handle_blocks(b):
     s.chunk_no += 1
     s.last_scan_block = b.number
 
+    return {
+        "chunk_no": s.chunk_no,
+        "chunk_start": start,
+        "chunk_stop": stop,
+        "chunk_debtors": len(chunk_debtors),
+        "new_debtors": len(new_debtors),
+        "backlog_size": len(s.backlog),
+        "seen_debtors_total": len(s.seen_debtors),
+        "last_scan_block": s.last_scan_block,
+    }
+
 
 @bot.on_shutdown()
 def handle_on_shutdown():
