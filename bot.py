@@ -204,6 +204,24 @@ def _process_live_borrow(s: BotState, log):
         }
 
 
+# Persistence
+def _session_dir(bot_name: str | None = None) -> str:
+    name = os.getenv("BOT_NAME", bot_name or "bot")
+    eco = chain.provider.network.ecosystem.name
+    net = chain.provider.network.name
+    return os.path.join(".silverback-sessions", name, eco, net)
+
+
+def _resolve_state_path(bot_name: str | None = None) -> str:
+    p = os.getenv("STATE_PATH")
+    if p:
+        p = os.path.abspath(os.path.expanduser(p))
+        if os.path.isdir(p):
+            return os.path.join(p, "bot-state.json")
+        return p
+    return os.path.join(_session_dir(bot_name), "bot-state.json")
+
+
 # Silverback
 @bot.on_startup()
 def init_state(startup_state):
