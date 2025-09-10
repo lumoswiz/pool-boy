@@ -188,6 +188,22 @@ def _backfill_once(s: BotState, head_block: int):
         }
 
 
+def _process_live_borrow(s: BotState, log):
+    debtor = _maybe_debtor(log, s.allowed_reserves)
+    if not debtor:
+        return {"borrow_event_ignored": 1}
+    with _try_lock(s.lock, 0.2) as got:
+        if not got:
+            return {"borrow_event_skipped_locked": 1}
+        added = _enqueue_many({debtor}, s)
+        return {
+            "borrow_event": 1,
+            "added_to_backlog": added,
+            "backlog_size": len(s.backlog),
+            "seen_debtors_total": len(s.seen_debtors),
+        }
+
+
 # Silverback
 @bot.on_startup()
 def init_state(startup_state):
@@ -207,6 +223,11 @@ def handle_blocks(b):
     if b.number - s.last_scan_block < s.scan_interval_blocks:
         return
     return _backfill_once(s, b.number)
+
+
+@bot.on_(POOL.Borrow, filter_args={"reserve": list(RESERVES.values())})
+def on_borrow(log):
+    return _process_live_borrow(bot.state.data, log)
 
 
 @bot.on_shutdown()
