@@ -1,6 +1,5 @@
 import os
 from dataclasses import dataclass, field
-from typing import Set
 
 import click
 from ape import Contract, accounts, chain
@@ -86,13 +85,14 @@ def _iter_block_ranges(start_block: int, stop_block: int, step: int):
         cur = end + 1
 
 
-def _get_historical_borrows(start_block: int, stop_block: int):
+def _get_historical_borrows(
+    start_block: int,
+    stop_block: int,
+    allowed_reserves: set[str],
+    step: int,
+):
     if stop_block < start_block:
         return
-
-    s = bot.state.data
-    allowed = s.allowed_reserves
-    step = s.rpc_max_log_range
 
     for start, stop in _iter_block_ranges(start_block, stop_block, step):
         f = LogFilter(
@@ -103,16 +103,21 @@ def _get_historical_borrows(start_block: int, stop_block: int):
         )
         try:
             for log in accounts.provider.get_contract_logs(f):
-                if log.reserve in allowed:
+                if log.reserve in allowed_reserves:
                     yield log
         except Exception as ex:
             click.echo(f"[get_logs] {start}-{stop} failed: {ex}")
             continue
 
 
-def _collect_borrowers_range(start_block: int, stop_block: int) -> Set[str]:
-    debtors: Set[str] = set()
-    for log in _get_historical_borrows(start_block, stop_block):
+def _collect_borrowers_range(
+    start_block: int,
+    stop_block: int,
+    allowed_reserves: set[str],
+    step: int,
+) -> set[str]:
+    debtors: set[str] = set()
+    for log in _get_historical_borrows(start_block, stop_block, allowed_reserves, step):
         debtors.add(log.onBehalfOf)
     return debtors
 
@@ -143,7 +148,12 @@ def handle_blocks(b):
     start = max(1, s.next_end - s.chunk_blocks + 1)
     stop = s.next_end
 
-    chunk_debtors = _collect_borrowers_range(start, stop)
+    chunk_debtors = _collect_borrowers_range(
+        start,
+        stop,
+        s.allowed_reserves,
+        s.rpc_max_log_range,
+    )
     new_debtors = chunk_debtors - s.seen_debtors
     s.seen_debtors |= chunk_debtors
     s.backlog |= new_debtors
@@ -156,6 +166,17 @@ def handle_blocks(b):
     s.next_end = start - 1
     s.chunk_no += 1
     s.last_scan_block = b.number
+
+    return {
+        "chunk_no": s.chunk_no,
+        "chunk_start": start,
+        "chunk_stop": stop,
+        "chunk_debtors": len(chunk_debtors),
+        "new_debtors": len(new_debtors),
+        "backlog_size": len(s.backlog),
+        "seen_debtors_total": len(s.seen_debtors),
+        "last_scan_block": s.last_scan_block,
+    }
 
 
 @bot.on_shutdown()
