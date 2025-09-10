@@ -6,19 +6,45 @@ import click
 from ape import Contract, accounts, chain
 from ape.types import LogFilter
 from silverback import SilverbackBot
+from web3 import Web3
 
 bot = SilverbackBot()
 
-# Addresses
-POOL = Contract("0xA238Dd80C259a72e81d7e4664a9801593F98d1c5")
 
-RESERVES = {
-    "WETH": "0x4200000000000000000000000000000000000006",
-    "cbETH": "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22",
-    "cbBTC": "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",
-    "wstETH": "0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452",
-}
+# Environment variables
+def _required_env(key: str) -> str:
+    val = os.getenv(key)
+    if val is None or not val.strip():
+        raise RuntimeError(f"Missing required environment variable: {key}")
+    return val
 
+
+def _require_checksum_addr(val: str, key: str) -> str:
+    try:
+        return Web3.to_checksum_address(val)
+    except (ValueError, TypeError):
+        raise ValueError(f"Invalid address for {key}: {val!r}")
+
+
+def _load_reserves_from_env(prefix: str = "RESERVE_") -> dict[str, str]:
+    reserves: dict[str, str] = {}
+    for k, v in os.environ.items():
+        if not k.startswith(prefix):
+            continue
+        sym = k[len(prefix) :]
+        if not sym:
+            continue
+        addr = _require_checksum_addr(v, k)
+        reserves[sym] = addr
+
+    if not reserves:
+        raise RuntimeError("No reserves configured. Set at least one RESERVE_<SYMBOL> env var, ")
+    return reserves
+
+
+POOL_ADDRESS = _require_checksum_addr(_required_env("POOL_ADDRESS"), "POOL_ADDRESS")
+POOL = Contract(POOL_ADDRESS)
+RESERVES = _load_reserves_from_env()
 ADDR_TO_SYMBOL = {addr: sym for sym, addr in RESERVES.items()}
 
 
