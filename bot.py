@@ -1,8 +1,9 @@
+import json
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from threading import Lock
-from typing import Set, Tuple
+from typing import Set
 
 import click
 from ape import Contract, accounts, chain
@@ -78,6 +79,14 @@ class BotState:
     backlog: set[str] = field(default_factory=set)
     backfill_busy: bool = False
     lock: Lock = field(default_factory=Lock)
+    last_backfill_head: int = 0
+
+
+def _cap_to_head(s: BotState, head: int) -> None:
+    if s.next_end is not None:
+        s.next_end = min(s.next_end, head)
+    if s.last_scan_block is not None:
+        s.last_scan_block = min(s.last_scan_block, head)
 
 
 # Backfill
@@ -127,14 +136,6 @@ def _try_lock(lock: Lock, timeout: float = 0.2):
             lock.release()
 
 
-def _plan_chunk(s: BotState, head_block: int) -> Tuple[int, int] | None:
-    if s.next_end is None or s.next_end > head_block:
-        s.next_end = head_block
-    start = max(1, s.next_end - s.chunk_blocks + 1)
-    stop = s.next_end
-    return None if stop < start else (start, stop)
-
-
 def _enqueue_many(addrs: Set[str], s: BotState) -> int:
     new = addrs - s.seen_debtors - s.backlog
     if not new:
@@ -144,48 +145,90 @@ def _enqueue_many(addrs: Set[str], s: BotState) -> int:
     return len(new)
 
 
-def _backfill_once(s: BotState, head_block: int):
-    if s is None:
-        return {"skipped_no_state": 1}
+FORWARD = "forward"
+BACKFILL = "backfill"
 
-    with _try_lock(s.lock, timeout=0.2) as got:
-        if not got:
-            return {"skipped_locked": 1}
 
-        plan = _plan_chunk(s, head_block)
-        if plan is None:
-            s.last_scan_block = head_block
-            return {
-                "noop": 1,
-                "chunk_no": s.chunk_no,
-                "chunk_start": max(1, (s.next_end or 1) - s.chunk_blocks + 1),
-                "chunk_stop": (s.next_end or 0),
-                "backlog_size": len(s.backlog),
-                "seen_debtors_total": len(s.seen_debtors),
-                "last_scan_block": s.last_scan_block,
-            }
+def _plan_window(s: BotState, head: int, mode: str) -> tuple[int, int] | None:
+    if mode == FORWARD:
+        start = (s.last_scan_block or 0) + 1
+        if start > head:
+            return None
+        stop = min(start + s.chunk_blocks - 1, head)
+        return start, stop
+    if mode == BACKFILL:
+        if s.next_end is None or s.next_end > head:
+            s.next_end = head
+        stop = s.next_end
+        if stop < 1:
+            return None
+        start = max(1, stop - s.chunk_blocks + 1)
+        if stop < start:
+            return None
+        return start, stop
+    raise ValueError(f"unknown mode: {mode}")
 
-        start, stop = plan
 
-        chunk_debtors = set(
-            _iter_borrowers_range(start, stop, s.rpc_max_log_range, s.allowed_reserves)
-        )
-        added = _enqueue_many(chunk_debtors, s)
+def _scan_window(s: BotState, start: int, stop: int) -> tuple[int, int]:
+    addrs = set(_iter_borrowers_range(start, stop, s.rpc_max_log_range, s.allowed_reserves))
+    added = _enqueue_many(addrs, s)
+    return len(addrs), added
 
+
+def _commit_window(s: BotState, head: int, mode: str, start: int, stop: int) -> None:
+    if mode == FORWARD:
+        s.last_scan_block = stop
+        return
+    if mode == BACKFILL:
         s.next_end = start - 1
         s.chunk_no += 1
-        s.last_scan_block = head_block
+        s.last_backfill_head = head
+        return
+    raise ValueError(f"unknown mode: {mode}")
 
+
+def _sync_once(s: BotState, head: int, mode: str, max_windows: int = 1):
+    if s is None:
+        return {f"{mode}_skipped_no_state": 1}
+    if not s.lock.acquire(timeout=0.2):
+        return {f"{mode}_skipped_locked": 1}
+    try:
+        windows = 0
+        uniq_total = 0
+        added_total = 0
+        first_start = None
+        last_stop = None
+        while windows < max_windows:
+            plan = _plan_window(s, head, mode)
+            if plan is None:
+                break
+            start, stop = plan
+
+            uniq, added = _scan_window(s, start, stop)
+            _commit_window(s, head, mode, start, stop)
+
+            if first_start is None:
+                first_start = start
+            last_stop = stop
+
+            windows += 1
+            uniq_total += uniq
+            added_total += added
+        span = (last_stop - first_start + 1) if (first_start is not None) else 0
         return {
-            "chunk_no": s.chunk_no,
-            "chunk_start": start,
-            "chunk_stop": stop,
-            "chunk_debtors": len(chunk_debtors),
-            "new_debtors": added,
+            f"{mode}_windows": windows,
+            f"{mode}_first": first_start or 0,
+            f"{mode}_last": last_stop or 0,
+            f"{mode}_span": span,
+            f"{mode}_unique": uniq_total,
+            f"{mode}_new": added_total,
             "backlog_size": len(s.backlog),
             "seen_debtors_total": len(s.seen_debtors),
             "last_scan_block": s.last_scan_block,
+            "next_end": s.next_end,
         }
+    finally:
+        s.lock.release()
 
 
 def _process_live_borrow(s: BotState, log):
@@ -204,25 +247,110 @@ def _process_live_borrow(s: BotState, log):
         }
 
 
+# Persistence
+def _session_dir(bot_name: str | None = None) -> str:
+    name = os.getenv("BOT_NAME", bot_name or "bot")
+    eco = chain.provider.network.ecosystem.name
+    net = chain.provider.network.name
+    return os.path.join(".silverback-sessions", name, eco, net)
+
+
+def _resolve_state_path(bot_name: str | None = None) -> str:
+    p = os.getenv("STATE_PATH")
+    if p:
+        p = os.path.abspath(os.path.expanduser(p))
+        if os.path.isdir(p):
+            return os.path.join(p, "bot-state.json")
+        return p
+    return os.path.join(_session_dir(bot_name), "bot-state.json")
+
+
+def _state_to_jsonable(s: BotState) -> dict:
+    return {
+        "next_end": s.next_end,
+        "last_scan_block": s.last_scan_block,
+        "seen_debtors": sorted(s.seen_debtors),
+        "backlog": sorted(s.backlog),
+    }
+
+
+def _state_from_jsonable(d: dict) -> BotState:
+    s = BotState()
+    if "next_end" in d:
+        s.next_end = d["next_end"]
+    s.last_scan_block = int(d.get("last_scan_block", s.last_scan_block))
+    s.seen_debtors = set(d.get("seen_debtors", []))
+    s.backlog = set(d.get("backlog", []))
+    return s
+
+
+def _atomic_write_json(path: str, obj: dict) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        f.flush()
+    os.replace(tmp, path)
+
+
+def _restore_state(path: str | None = None) -> tuple[BotState | None, str]:
+    p = path or _resolve_state_path()
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return _state_from_jsonable(payload), p
+    except FileNotFoundError:
+        return None, p
+    except Exception as e:
+        click.echo(f"[state] restore failed ({p}): {e}")
+        return None, p
+
+
+def _save_state(s: BotState, path: str | None = None) -> str:
+    p = path or _resolve_state_path()
+    try:
+        _atomic_write_json(p, _state_to_jsonable(s))
+    except Exception as e:
+        click.echo(f"[state] snapshot failed ({p}): {e}")
+    return p
+
+
 # Silverback
 @bot.on_startup()
 def init_state(startup_state):
-    s = BotState(allowed_reserves=set(RESERVES.values()))
-    last = (
-        startup_state.get("last_block_processed")
-        if isinstance(startup_state, dict)
-        else getattr(startup_state, "last_block_processed", None)
-    )
-    s.next_end = last or chain.blocks.head.number
+    s, path = _restore_state()
+    restored = s is not None
+    if s is None:
+        s = BotState()
+    s.allowed_reserves = set(RESERVES.values())
+    head = chain.blocks.head.number
+    if s.next_end is None:
+        last = (
+            startup_state.get("last_block_processed")
+            if isinstance(startup_state, dict)
+            else getattr(startup_state, "last_block_processed", None)
+        )
+        s.next_end = last or head
+    if not restored:
+        s.last_scan_block = head
+    _cap_to_head(s, head)
     bot.state.data = s
+    click.echo(
+        f"[state] {'restored' if restored else 'fresh'} init; path={path}, next_end={s.next_end}"
+    )
 
 
 @bot.on_(chain.blocks)
 def handle_blocks(b):
     s = bot.state.data
-    if b.number - s.last_scan_block < s.scan_interval_blocks:
+    head = b.number
+    if head > s.last_scan_block:
+        stats = _sync_once(s, head, FORWARD, max_windows=4)
+        if s.last_scan_block < head:
+            return {"catchup_in_progress": 1, **(stats or {})}
+    if head - s.last_backfill_head < s.scan_interval_blocks:
         return
-    return _backfill_once(s, b.number)
+    return _sync_once(s, head, BACKFILL, max_windows=1)
 
 
 @bot.on_(POOL.Borrow, filter_args={"reserve": list(RESERVES.values())})
@@ -233,7 +361,10 @@ def on_borrow(log):
 @bot.on_shutdown()
 def handle_on_shutdown():
     s = bot.state.data
+    path = _save_state(s)
+    click.echo(f"[state] snapshot saved to: {path}")
     return {
         "backlog_size": len(s.backlog),
         "seen_debtors_total": len(s.seen_debtors),
+        "state_saved": True,
     }
