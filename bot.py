@@ -1,3 +1,5 @@
+import os
+from dataclasses import dataclass, field
 from typing import Set
 
 import click
@@ -24,12 +26,32 @@ def addr(symbol: str) -> str | None:
     return RESERVES.get(symbol)
 
 
+# Bot State
+def _env_int(key: str, default: int) -> int:
+    val = os.getenv(key)
+    if val is None or not val.strip():
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        return default
+
+
+@dataclass
+class BotState:
+    allowed_reserves: set[str] = field(default_factory=set)
+    chunk_blocks: int = _env_int("CHUNK_BLOCKS", 100)
+    scan_interval_blocks: int = _env_int("SCAN_INTERVAL_BLOCKS", 5)
+    rpc_max_log_range: int = _env_int("RPC_MAX_LOG_RANGE", 10)
+    last_scan_block: int = 0
+    next_end: int | None = None
+    chunk_no: int = 0
+    seen_debtors: set[str] = field(default_factory=set)
+    backlog: set[str] = field(default_factory=set)
+    backfill_busy: bool = False
+
+
 # Backfill
-CHUNK_BLOCKS = 100
-SCAN_INTERVAL_BLOCKS = 5
-RPC_MAX_LOG_RANGE = 10
-
-
 def _iter_block_ranges(start_block: int, stop_block: int, step: int):
     cur = start_block
     while cur <= stop_block:
@@ -41,20 +63,24 @@ def _iter_block_ranges(start_block: int, stop_block: int, step: int):
 def _get_historical_borrows(start_block: int, stop_block: int):
     if stop_block < start_block:
         return
-    allowed = bot.state.allowed_reserves
-    for s, e in _iter_block_ranges(start_block, stop_block, RPC_MAX_LOG_RANGE):
+
+    s = bot.state.data
+    allowed = s.allowed_reserves
+    step = s.rpc_max_log_range
+
+    for start, stop in _iter_block_ranges(start_block, stop_block, step):
         f = LogFilter(
             addresses=[POOL.address],
             events=[POOL.Borrow.abi],
-            start_block=s,
-            stop_block=e,
+            start_block=start,
+            stop_block=stop,
         )
         try:
             for log in accounts.provider.get_contract_logs(f):
                 if log.reserve in allowed:
                     yield log
         except Exception as ex:
-            click.echo(f"[get_logs] {s}-{e} failed: {ex}")
+            click.echo(f"[get_logs] {start}-{stop} failed: {ex}")
             continue
 
 
@@ -67,30 +93,22 @@ def _collect_borrowers_range(start_block: int, stop_block: int) -> Set[str]:
 
 # Silverback
 @bot.on_startup()
-def init_state(startup_state=None):
-    bot.state.allowed_reserves = set(RESERVES.values())
-    bot.state.chunk_blocks = CHUNK_BLOCKS
-    bot.state.scan_interval_blocks = SCAN_INTERVAL_BLOCKS
-    bot.state.last_scan_block = 0
-
-    bot.state.seen_debtors = set()
-    bot.state.backlog = set()
-
-    last = None
-    if isinstance(startup_state, dict):
-        last = startup_state.get("last_block_processed")
-    else:
-        last = getattr(startup_state, "last_block_processed", None)
-
-    bot.state.next_end = last or chain.blocks.head.number
-    bot.state.chunk_no = 0
+def init_state(startup_state):
+    s = BotState(allowed_reserves=set(RESERVES.values()))
+    last = (
+        startup_state.get("last_block_processed")
+        if isinstance(startup_state, dict)
+        else getattr(startup_state, "last_block_processed", None)
+    )
+    s.next_end = last or chain.blocks.head.number
+    bot.state.data = s
 
 
 @bot.on_(chain.blocks)
 def handle_blocks(b):
-    s = bot.state
-    last = getattr(s, "last_scan_block", 0)
-    if b.number - last < s.scan_interval_blocks:
+    s = bot.state.data
+
+    if b.number - s.last_scan_block < s.scan_interval_blocks:
         return
 
     if s.next_end is None:
@@ -116,7 +134,8 @@ def handle_blocks(b):
 
 @bot.on_shutdown()
 def handle_on_shutdown():
-    seen = getattr(bot.state, "seen_debtors", set())
-    backlog = getattr(bot.state, "backlog", set())
+    s = bot.state.data
+    seen = s.seen_debtors if s else set()
+    backlog = s.backlog if s else set()
     click.echo(f"[shutdown] seen_debtors: total={len(seen)}")
     click.echo(f"[shutdown] backlog: total={len(backlog)}")
