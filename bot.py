@@ -218,6 +218,10 @@ def _sync_once(s: BotState, head: int, mode: str, max_windows: int = 1):
             windows += 1
             uniq_total += uniq
             added_total += added
+
+        if windows == 0:
+            return None
+
         span = (last_stop - first_start + 1) if (first_start is not None) else 0
         return {
             f"{mode}_windows": windows,
@@ -351,8 +355,8 @@ def handle_blocks(b):
     head = b.number
     if head > s.last_scan_block:
         stats = _sync_once(s, head, FORWARD, max_windows=4)
-        if s.last_scan_block < head:
-            return {"catchup_in_progress": 1, **(stats or {})}
+        if stats and stats.get("forward_windows", 0) > 0 and s.last_scan_block < head:
+            return {"catchup_in_progress": 1, **stats}
     if head - s.last_backfill_head < s.scan_interval_blocks:
         return
     return _sync_once(s, head, BACKFILL, max_windows=1)
