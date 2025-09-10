@@ -3,7 +3,7 @@ import os
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from threading import Lock
-from typing import Set
+from typing import Mapping, Set
 
 import click
 from ape import Contract, accounts, chain
@@ -74,8 +74,7 @@ class BotState:
     rpc_max_log_range: int = _env_int("RPC_MAX_LOG_RANGE", 10)
     last_scan_block: int = 0
     next_end: int | None = None
-    chunk_no: int = 0
-    seen_debtors: set[str] = field(default_factory=set)
+    seen_borrow_block: dict[str, int] = field(default_factory=dict)
     backlog: set[str] = field(default_factory=set)
     backfill_busy: bool = False
     lock: Lock = field(default_factory=Lock)
@@ -119,11 +118,10 @@ def _maybe_debtor(log, allowed: Set[str]) -> str | None:
     return log.onBehalfOf if getattr(log, "reserve", None) in allowed else None
 
 
-def _iter_borrowers_range(start_block: int, stop_block: int, step: int, allowed: set[str]):
+def _iter_borrowers_with_height(start_block: int, stop_block: int, step: int, allowed: set[str]):
     for log in _iter_borrow_logs_range(start_block, stop_block, step):
-        d = _maybe_debtor(log, allowed)
-        if d:
-            yield d
+        if getattr(log, "reserve", None) in allowed:
+            yield (log.onBehalfOf, int(log.block_number))
 
 
 @contextmanager
@@ -136,13 +134,16 @@ def _try_lock(lock: Lock, timeout: float = 0.2):
             lock.release()
 
 
-def _enqueue_many(addrs: Set[str], s: BotState) -> int:
-    new = addrs - s.seen_debtors - s.backlog
-    if not new:
-        return 0
-    s.seen_debtors |= new
-    s.backlog |= new
-    return len(new)
+def _enqueue_many_newer(addr_heights: Mapping[str, int], s: BotState) -> int:
+    added = 0
+    for a, h in addr_heights.items():
+        prev = s.seen_borrow_block.get(a)
+        if prev is None or h > prev:
+            s.seen_borrow_block[a] = h
+            if a not in s.backlog:
+                s.backlog.add(a)
+                added += 1
+    return added
 
 
 FORWARD = "forward"
@@ -170,9 +171,13 @@ def _plan_window(s: BotState, head: int, mode: str) -> tuple[int, int] | None:
 
 
 def _scan_window(s: BotState, start: int, stop: int) -> tuple[int, int]:
-    addrs = set(_iter_borrowers_range(start, stop, s.rpc_max_log_range, s.allowed_reserves))
-    added = _enqueue_many(addrs, s)
-    return len(addrs), added
+    latest: dict[str, int] = {}
+    for a, h in _iter_borrowers_with_height(start, stop, s.rpc_max_log_range, s.allowed_reserves):
+        prev = latest.get(a)
+        if prev is None or h > prev:
+            latest[a] = h
+    added = _enqueue_many_newer(latest, s)
+    return len(latest), added
 
 
 def _commit_window(s: BotState, head: int, mode: str, start: int, stop: int) -> None:
@@ -181,7 +186,6 @@ def _commit_window(s: BotState, head: int, mode: str, start: int, stop: int) -> 
         return
     if mode == BACKFILL:
         s.next_end = start - 1
-        s.chunk_no += 1
         s.last_backfill_head = head
         return
     raise ValueError(f"unknown mode: {mode}")
@@ -214,6 +218,10 @@ def _sync_once(s: BotState, head: int, mode: str, max_windows: int = 1):
             windows += 1
             uniq_total += uniq
             added_total += added
+
+        if windows == 0:
+            return None
+
         span = (last_stop - first_start + 1) if (first_start is not None) else 0
         return {
             f"{mode}_windows": windows,
@@ -223,7 +231,7 @@ def _sync_once(s: BotState, head: int, mode: str, max_windows: int = 1):
             f"{mode}_unique": uniq_total,
             f"{mode}_new": added_total,
             "backlog_size": len(s.backlog),
-            "seen_debtors_total": len(s.seen_debtors),
+            "seen_debtors_total": len(s.seen_borrow_block),
             "last_scan_block": s.last_scan_block,
             "next_end": s.next_end,
         }
@@ -235,15 +243,16 @@ def _process_live_borrow(s: BotState, log):
     debtor = _maybe_debtor(log, s.allowed_reserves)
     if not debtor:
         return {"borrow_event_ignored": 1}
+    height = int(log.block_number)
     with _try_lock(s.lock, 0.2) as got:
         if not got:
             return {"borrow_event_skipped_locked": 1}
-        added = _enqueue_many({debtor}, s)
+        added = _enqueue_many_newer({debtor: height}, s)
         return {
             "borrow_event": 1,
             "added_to_backlog": added,
             "backlog_size": len(s.backlog),
-            "seen_debtors_total": len(s.seen_debtors),
+            "seen_debtors_total": len(s.seen_borrow_block),
         }
 
 
@@ -269,7 +278,7 @@ def _state_to_jsonable(s: BotState) -> dict:
     return {
         "next_end": s.next_end,
         "last_scan_block": s.last_scan_block,
-        "seen_debtors": sorted(s.seen_debtors),
+        "seen_borrow_block": s.seen_borrow_block,
         "backlog": sorted(s.backlog),
     }
 
@@ -279,7 +288,7 @@ def _state_from_jsonable(d: dict) -> BotState:
     if "next_end" in d:
         s.next_end = d["next_end"]
     s.last_scan_block = int(d.get("last_scan_block", s.last_scan_block))
-    s.seen_debtors = set(d.get("seen_debtors", []))
+    s.seen_borrow_block = {k: int(v) for k, v in d.get("seen_borrow_block", {}).items()}
     s.backlog = set(d.get("backlog", []))
     return s
 
@@ -346,8 +355,8 @@ def handle_blocks(b):
     head = b.number
     if head > s.last_scan_block:
         stats = _sync_once(s, head, FORWARD, max_windows=4)
-        if s.last_scan_block < head:
-            return {"catchup_in_progress": 1, **(stats or {})}
+        if stats and stats.get("forward_windows", 0) > 0 and s.last_scan_block < head:
+            return {"catchup_in_progress": 1, **stats}
     if head - s.last_backfill_head < s.scan_interval_blocks:
         return
     return _sync_once(s, head, BACKFILL, max_windows=1)
@@ -365,6 +374,6 @@ def handle_on_shutdown():
     click.echo(f"[state] snapshot saved to: {path}")
     return {
         "backlog_size": len(s.backlog),
-        "seen_debtors_total": len(s.seen_debtors),
+        "seen_debtors_total": len(s.seen_borrow_block),
         "state_saved": True,
     }
