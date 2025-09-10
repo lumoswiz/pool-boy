@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass, field
+from threading import Lock
 
 import click
 from ape import Contract, accounts, chain
@@ -74,6 +75,7 @@ class BotState:
     seen_debtors: set[str] = field(default_factory=set)
     backlog: set[str] = field(default_factory=set)
     backfill_busy: bool = False
+    lock: Lock = field(default_factory=Lock)
 
 
 # Backfill
@@ -122,6 +124,67 @@ def _collect_borrowers_range(
     return debtors
 
 
+def _backfill_once(s: BotState, head_block: int):
+    if s is None:
+        return {"skipped_no_state": 1}
+
+    if not s.lock.acquire(timeout=0.2):
+        return {"skipped_locked": 1}
+
+    try:
+        if s.next_end is None or s.next_end > head_block:
+            s.next_end = head_block
+
+        start = max(1, s.next_end - s.chunk_blocks + 1)
+        stop = s.next_end
+
+        if stop < start:
+            s.last_scan_block = head_block
+            return {
+                "noop": 1,
+                "chunk_no": s.chunk_no,
+                "chunk_start": start,
+                "chunk_stop": stop,
+                "backlog_size": len(s.backlog),
+                "seen_debtors_total": len(s.seen_debtors),
+                "last_scan_block": s.last_scan_block,
+            }
+
+        chunk_debtors = _collect_borrowers_range(
+            start,
+            stop,
+            s.allowed_reserves,
+            s.rpc_max_log_range,
+        )
+
+        new_debtors = chunk_debtors - s.seen_debtors - s.backlog
+        if new_debtors:
+            s.seen_debtors |= new_debtors
+            s.backlog |= new_debtors
+
+        click.echo(
+            f"[backfill] chunk #{s.chunk_no} {start}-{stop} "
+            f"-> {len(chunk_debtors)} in chunk, {len(new_debtors)} new, total {len(s.seen_debtors)}"
+        )
+
+        s.next_end = start - 1
+        s.chunk_no += 1
+        s.last_scan_block = head_block
+
+        return {
+            "chunk_no": s.chunk_no,
+            "chunk_start": start,
+            "chunk_stop": stop,
+            "chunk_debtors": len(chunk_debtors),
+            "new_debtors": len(new_debtors),
+            "backlog_size": len(s.backlog),
+            "seen_debtors_total": len(s.seen_debtors),
+            "last_scan_block": s.last_scan_block,
+        }
+    finally:
+        s.lock.release()
+
+
 # Silverback
 @bot.on_startup()
 def init_state(startup_state):
@@ -138,45 +201,9 @@ def init_state(startup_state):
 @bot.on_(chain.blocks)
 def handle_blocks(b):
     s = bot.state.data
-
     if b.number - s.last_scan_block < s.scan_interval_blocks:
         return
-
-    if s.next_end is None:
-        s.next_end = b.number
-
-    start = max(1, s.next_end - s.chunk_blocks + 1)
-    stop = s.next_end
-
-    chunk_debtors = _collect_borrowers_range(
-        start,
-        stop,
-        s.allowed_reserves,
-        s.rpc_max_log_range,
-    )
-    new_debtors = chunk_debtors - s.seen_debtors
-    s.seen_debtors |= chunk_debtors
-    s.backlog |= new_debtors
-
-    click.echo(
-        f"[backfill] chunk #{s.chunk_no} {start}-{stop} "
-        f"-> {len(chunk_debtors)} in chunk, {len(new_debtors)} new, total {len(s.seen_debtors)}"
-    )
-
-    s.next_end = start - 1
-    s.chunk_no += 1
-    s.last_scan_block = b.number
-
-    return {
-        "chunk_no": s.chunk_no,
-        "chunk_start": start,
-        "chunk_stop": stop,
-        "chunk_debtors": len(chunk_debtors),
-        "new_debtors": len(new_debtors),
-        "backlog_size": len(s.backlog),
-        "seen_debtors_total": len(s.seen_debtors),
-        "last_scan_block": s.last_scan_block,
-    }
+    return _backfill_once(s, b.number)
 
 
 @bot.on_shutdown()
