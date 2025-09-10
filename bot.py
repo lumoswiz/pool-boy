@@ -1,5 +1,8 @@
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from threading import Lock
+from typing import Set, Tuple
 
 import click
 from ape import Contract, accounts, chain
@@ -74,6 +77,7 @@ class BotState:
     seen_debtors: set[str] = field(default_factory=set)
     backlog: set[str] = field(default_factory=set)
     backfill_busy: bool = False
+    lock: Lock = field(default_factory=Lock)
 
 
 # Backfill
@@ -85,41 +89,103 @@ def _iter_block_ranges(start_block: int, stop_block: int, step: int):
         cur = end + 1
 
 
-def _get_historical_borrows(
-    start_block: int,
-    stop_block: int,
-    allowed_reserves: set[str],
-    step: int,
-):
+def _iter_logs_range(addresses, events, start_block: int, stop_block: int, step: int):
     if stop_block < start_block:
         return
-
-    for start, stop in _iter_block_ranges(start_block, stop_block, step):
-        f = LogFilter(
-            addresses=[POOL.address],
-            events=[POOL.Borrow.abi],
-            start_block=start,
-            stop_block=stop,
-        )
+    for start, end in _iter_block_ranges(start_block, stop_block, step):
+        f = LogFilter(addresses=addresses, events=events, start_block=start, stop_block=end)
         try:
             for log in accounts.provider.get_contract_logs(f):
-                if log.reserve in allowed_reserves:
-                    yield log
+                yield log
         except Exception as ex:
-            click.echo(f"[get_logs] {start}-{stop} failed: {ex}")
+            click.echo(f"[get_logs] {start}-{end} failed: {ex}")
             continue
 
 
-def _collect_borrowers_range(
-    start_block: int,
-    stop_block: int,
-    allowed_reserves: set[str],
-    step: int,
-) -> set[str]:
-    debtors: set[str] = set()
-    for log in _get_historical_borrows(start_block, stop_block, allowed_reserves, step):
-        debtors.add(log.onBehalfOf)
-    return debtors
+def _iter_borrow_logs_range(start_block: int, stop_block: int, step: int):
+    return _iter_logs_range([POOL.address], [POOL.Borrow.abi], start_block, stop_block, step)
+
+
+def _maybe_debtor(log, allowed: Set[str]) -> str | None:
+    return log.onBehalfOf if getattr(log, "reserve", None) in allowed else None
+
+
+def _iter_borrowers_range(start_block: int, stop_block: int, step: int, allowed: set[str]):
+    for log in _iter_borrow_logs_range(start_block, stop_block, step):
+        d = _maybe_debtor(log, allowed)
+        if d:
+            yield d
+
+
+@contextmanager
+def _try_lock(lock: Lock, timeout: float = 0.2):
+    got = lock.acquire(timeout=timeout)
+    try:
+        yield got
+    finally:
+        if got:
+            lock.release()
+
+
+def _plan_chunk(s: BotState, head_block: int) -> Tuple[int, int] | None:
+    if s.next_end is None or s.next_end > head_block:
+        s.next_end = head_block
+    start = max(1, s.next_end - s.chunk_blocks + 1)
+    stop = s.next_end
+    return None if stop < start else (start, stop)
+
+
+def _enqueue_many(addrs: Set[str], s: BotState) -> int:
+    new = addrs - s.seen_debtors - s.backlog
+    if not new:
+        return 0
+    s.seen_debtors |= new
+    s.backlog |= new
+    return len(new)
+
+
+def _backfill_once(s: BotState, head_block: int):
+    if s is None:
+        return {"skipped_no_state": 1}
+
+    with _try_lock(s.lock, timeout=0.2) as got:
+        if not got:
+            return {"skipped_locked": 1}
+
+        plan = _plan_chunk(s, head_block)
+        if plan is None:
+            s.last_scan_block = head_block
+            return {
+                "noop": 1,
+                "chunk_no": s.chunk_no,
+                "chunk_start": max(1, (s.next_end or 1) - s.chunk_blocks + 1),
+                "chunk_stop": (s.next_end or 0),
+                "backlog_size": len(s.backlog),
+                "seen_debtors_total": len(s.seen_debtors),
+                "last_scan_block": s.last_scan_block,
+            }
+
+        start, stop = plan
+
+        chunk_debtors = set(
+            _iter_borrowers_range(start, stop, s.rpc_max_log_range, s.allowed_reserves)
+        )
+        added = _enqueue_many(chunk_debtors, s)
+
+        s.next_end = start - 1
+        s.chunk_no += 1
+        s.last_scan_block = head_block
+
+        return {
+            "chunk_no": s.chunk_no,
+            "chunk_start": start,
+            "chunk_stop": stop,
+            "chunk_debtors": len(chunk_debtors),
+            "new_debtors": added,
+            "backlog_size": len(s.backlog),
+            "seen_debtors_total": len(s.seen_debtors),
+            "last_scan_block": s.last_scan_block,
+        }
 
 
 # Silverback
@@ -138,51 +204,15 @@ def init_state(startup_state):
 @bot.on_(chain.blocks)
 def handle_blocks(b):
     s = bot.state.data
-
     if b.number - s.last_scan_block < s.scan_interval_blocks:
         return
-
-    if s.next_end is None:
-        s.next_end = b.number
-
-    start = max(1, s.next_end - s.chunk_blocks + 1)
-    stop = s.next_end
-
-    chunk_debtors = _collect_borrowers_range(
-        start,
-        stop,
-        s.allowed_reserves,
-        s.rpc_max_log_range,
-    )
-    new_debtors = chunk_debtors - s.seen_debtors
-    s.seen_debtors |= chunk_debtors
-    s.backlog |= new_debtors
-
-    click.echo(
-        f"[backfill] chunk #{s.chunk_no} {start}-{stop} "
-        f"-> {len(chunk_debtors)} in chunk, {len(new_debtors)} new, total {len(s.seen_debtors)}"
-    )
-
-    s.next_end = start - 1
-    s.chunk_no += 1
-    s.last_scan_block = b.number
-
-    return {
-        "chunk_no": s.chunk_no,
-        "chunk_start": start,
-        "chunk_stop": stop,
-        "chunk_debtors": len(chunk_debtors),
-        "new_debtors": len(new_debtors),
-        "backlog_size": len(s.backlog),
-        "seen_debtors_total": len(s.seen_debtors),
-        "last_scan_block": s.last_scan_block,
-    }
+    return _backfill_once(s, b.number)
 
 
 @bot.on_shutdown()
 def handle_on_shutdown():
     s = bot.state.data
-    seen = s.seen_debtors if s else set()
-    backlog = s.backlog if s else set()
-    click.echo(f"[shutdown] seen_debtors: total={len(seen)}")
-    click.echo(f"[shutdown] backlog: total={len(backlog)}")
+    return {
+        "backlog_size": len(s.backlog),
+        "seen_debtors_total": len(s.seen_debtors),
+    }
